@@ -8,6 +8,23 @@ import matplotlib.pyplot as plt
 
 st.set_page_config(page_title="NutriBridge", layout="wide")
 
+# ---- App Heading ----
+st.markdown(
+    """
+    <div style="text-align:center; padding:20px; border-radius:8px;">
+        <h1 style="color:#FF4B4B; font-size:42px; font-weight:900;">
+            NutriBridge: Personal Nutrition & Food Planning System
+        </h1>
+        <h3 style="color:#cfcfcf; margin-top:-10px;">
+            Powered by Integer Linear Programming (ILP) & Data Analytics
+        </h3>
+        <hr style="border: 1px solid #777;">
+    </div>
+    """,
+    unsafe_allow_html=True
+)
+
+
 # ===========================================================
 # Helper Functions
 # ===========================================================
@@ -256,3 +273,4 @@ if st.button("Generate 7-Day Plan"):
     plt.title("Most Used Ingredients")
     plt.xlabel("Count")
     st.pyplot(plt)
+
