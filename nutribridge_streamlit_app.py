@@ -1,424 +1,258 @@
-# nutribridge_streamlit_app.py
-# Final Nutri-Bridge Streamlit app — upload small CSV and generate 7-day plan
 import streamlit as st
 import pandas as pd
 import numpy as np
 from ast import literal_eval
-from collections import Counter
 from pulp import LpProblem, LpVariable, LpMinimize, LpBinary, lpSum, PULP_CBC_CMD
+from collections import Counter
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Nutri-Bridge", layout="wide")
+st.set_page_config(page_title="NutriBridge", layout="wide")
 
-# -------------------- Helpers --------------------
+# ===========================================================
+# Helper Functions
+# ===========================================================
+
 def normalize_ing(x):
-    """Normalize ingredient string to a compact token."""
-    if x is None:
+    if not isinstance(x, str):
         return ""
-    s = str(x).lower().strip()
-    for ch in ['’','`','"',"'","(",")",",",".","/","\\","-","&",":",";"]:
-        s = s.replace(ch, " ")
-    return "_".join(s.split())
+    s = x.lower().strip()
+    return "_".join(s.replace(",", "").replace(".", "").replace("-", " ").split())
 
-def safe_eval_list(x):
-    """Try to literal_eval a list representation; return [] on error."""
-    if pd.isna(x):
-        return []
-    if isinstance(x, (list, tuple)):
-        return list(x)
+def safe_list(x):
     try:
         v = literal_eval(x)
-        if isinstance(v, (list, tuple)):
-            return list(v)
-    except Exception:
-        pass
-    # fallback: if string with commas, split
-    if isinstance(x, str) and ("," in x):
-        return [s.strip() for s in x.split(",") if s.strip()]
-    return []
-
-# -------------------- CSV loader & preprocess --------------------
-def load_recipes(path_or_buffer):
-    # robust read (python engine tolerates odd rows)
-    try:
-        df = pd.read_csv(path_or_buffer, engine="python", on_bad_lines="skip", quoting=3)
-    except Exception as e:
-        st.error(f"Failed reading CSV: {e}")
-        return pd.DataFrame()
-
-    # ensure id/name exist
-    if "id" not in df.columns and "recipe_id" in df.columns:
-        df = df.rename(columns={"recipe_id":"id"})
-    if "id" not in df.columns:
-        df["id"] = range(len(df))
-
-    if "name" not in df.columns:
-        df["name"] = df["id"].astype(str)
-
-    # ingredients: parse into list then normalize
-    if "ingredients" in df.columns:
-        df["ing_list_raw"] = df["ingredients"].apply(safe_eval_list)
-    else:
-        df["ing_list_raw"] = [[] for _ in range(len(df))]
-    df["ing_list"] = df["ing_list_raw"].apply(lambda lst: [normalize_ing(i) for i in lst if i])
-
-    # nutrition: try to parse "nutrition" or look for calories/protein columns
-    df["calories"] = np.nan
-    df["protein_g"] = np.nan
-    if "nutrition" in df.columns:
-        def parse_nut(v):
-            try:
-                arr = literal_eval(v) if isinstance(v, str) else v
-                if isinstance(arr, (list,tuple)) and len(arr) >= 2:
-                    return float(arr[0]), float(arr[1])
-            except:
-                pass
-            return np.nan, np.nan
-        parsed = df["nutrition"].apply(parse_nut)
-        df["calories"] = [p[0] for p in parsed]
-        df["protein_g"] = [p[1] for p in parsed]
-
-    # fallback columns
-    if "calories" in df.columns and df["calories"].isnull().all():
-        try:
-            df["calories"] = pd.to_numeric(df["calories"], errors="coerce")
-        except:
-            pass
-    if "protein" in df.columns and ("protein_g" not in df.columns or df["protein_g"].isnull().all()):
-        df["protein_g"] = pd.to_numeric(df["protein"], errors="coerce")
-
-    # fill defaults for missing nutrition to avoid division by zero
-    df["calories"] = pd.to_numeric(df["calories"], errors="coerce").fillna(250.0)
-    df["protein_g"] = pd.to_numeric(df["protein_g"], errors="coerce").fillna(12.0)
-
-    # cost estimate
-    if "cost_est" not in df.columns:
-        df["cost_est"] = 20.0
-    df["cost_est"] = pd.to_numeric(df["cost_est"], errors="coerce").fillna(20.0)
-
-    # meal_type detection (smart heuristic)
-    def detect_meal(row):
-        name = str(row.get("name","")).lower()
-        tags = str(row.get("tags","")).lower()
-        if any(w in name for w in ["omelet","omelette","pancake","cereal","breakfast","latte","smoothie","shake","waffle"]):
-            return "breakfast"
-        if any(w in name for w in ["sandwich","salad","bowl","wrap","burger","rice","lunch"]):
-            return "lunch"
-        if any(w in name for w in ["pasta","steak","curry","biryani","pizza","dinner","stew","roast"]):
-            return "dinner"
-        if "breakfast" in tags: return "breakfast"
-        if "lunch" in tags: return "lunch"
-        if "dinner" in tags: return "dinner"
-        return "general"
-    df["meal_type"] = df.apply(detect_meal, axis=1)
-
-    # cuisine detection from tags/name
-    cuisines_list = ["indian","mexican","italian","chinese","thai","japanese","portuguese","american","korean","french"]
-    def detect_cuisine(row):
-        text = (str(row.get("tags","")) + " " + str(row.get("name",""))).lower()
-        for c in cuisines_list:
-            if c in text:
-                return c
-        return "general"
-    df["cuisine"] = df.apply(detect_cuisine, axis=1)
-
-    # ensure id is int
-    try:
-        df["id"] = df["id"].astype(int)
+        return list(v) if isinstance(v, (list, tuple)) else []
     except:
-        df["id"] = range(len(df))
+        return []
 
-    return df
+def detect_meal(name, tags):
+    t = (str(name) + str(tags)).lower()
+    if "breakfast" in t: return "breakfast"
+    if "lunch" in t: return "lunch"
+    if "dinner" in t: return "dinner"
+    return "lunch"  # fallback ensures 3 meals/day exist
 
-# -------------------- ILP Daily Planner --------------------
-def build_day_plan(day_idx: int, recipes_df: pd.DataFrame, user: dict,
-                   last_cuisines: list, used_recipes: set, cal_tgt: float, pro_tgt: float):
-    """
-    Returns: dict with keys: meals (list of 3 meal dicts), nutrition (cal, protein), cuisines (list), used_recipes (set)
-    """
-    # filter by preferred cuisines (but fallback if too small)
-    pref = [c.strip().lower() for c in user.get("preferred_cuisines", []) if c.strip()]
-    if pref:
-        df = recipes_df[recipes_df["cuisine"].isin(pref)].copy()
-    else:
-        df = recipes_df.copy()
-    # respect restrictions
-    restrictions = [normalize_ing(r) for r in user.get("restrictions", []) if r and r.strip()]
-    if restrictions:
-        df = df[~df["ing_list"].apply(lambda ings: any(r in ing for r in restrictions for ing in ings))]
-    if df.shape[0] < 10:
-        df = recipes_df.copy()
+def detect_cuisine(name, tags):
+    cuisines = ["indian","italian","mexican","chinese","thai","american","japanese","korean"]
+    t = (str(name) + str(tags)).lower()
+    for c in cuisines:
+        if c in t:
+            return c
+    return "general"
 
-    # rank and limit pool
-    df["rank_score"] = (2.0 * (df["protein_g"] / df["calories"].replace(0,1))) - (0.01 * df["cost_est"])
-    pool = df.sort_values("rank_score", ascending=False).head(120)
+# ===========================================================
+# Load Data
+# ===========================================================
 
-    # build meal-specific pools, fallback to pool if none
-    pools = {}
-    for m in ["breakfast","lunch","dinner"]:
-        sub = pool[pool["meal_type"] == m]
-        pools[m] = sub.head(40) if not sub.empty else pool.head(40)
+uploaded = st.file_uploader("Upload RAW_recipes_small.csv", type=["csv"])
+if uploaded:
+    df = pd.read_csv(uploaded, engine="python", on_bad_lines="skip")
 
-    # create rec_map and ILP variables
-    rec_map = {}
-    for m, sub in pools.items():
-        for _, r in sub.iterrows():
-            rec_map[(m, int(r["id"]))] = r
+    df["ingredients"] = df["ingredients"].apply(safe_list)
+    df["ing_list"] = df["ingredients"].apply(lambda lst: [normalize_ing(i) for i in lst])
 
-    # define ILP
-    prob = LpProblem(f"NutriBridge_Day_{day_idx}", LpMinimize)
-    x = {k: LpVariable(f"x_{k[0]}_{k[1]}", cat=LpBinary) for k in rec_map.keys()}
+    df["calories"] = df["nutrition"].apply(lambda x: literal_eval(x)[0] if isinstance(x,str) else np.nan)
+    df["protein_g"] = df["nutrition"].apply(lambda x: literal_eval(x)[1] if isinstance(x,str) else np.nan)
+    df["meal_type"] = df.apply(lambda r: detect_meal(r["name"], r["tags"]), axis=1)
+    df["cuisine"] = df.apply(lambda r: detect_cuisine(r["name"], r["tags"]), axis=1)
+    df["cost_est"] = 20
 
-    # exactly one selection per meal
-    for m in ["breakfast","lunch","dinner"]:
-        prob += lpSum([x[k] for k in x if k[0] == m]) == 1
+    df.dropna(subset=["calories","protein_g"], inplace=True)
 
-    # nutrition sums
-    total_cal = lpSum([x[k] * float(rec_map[k]["calories"]) for k in x])
-    total_pro = lpSum([x[k] * float(rec_map[k]["protein_g"]) for k in x])
+else:
+    df = pd.DataFrame()
+    st.warning("⚠ Upload RAW_recipes_small.csv to continue.")
 
-    # constraints with tolerance
-    prob += total_cal >= (1 - user.get("cal_tol", 0.12)) * cal_tgt
-    prob += total_cal <= (1 + user.get("cal_tol", 0.12)) * cal_tgt
-    prob += total_pro >= (1 - user.get("pro_tol", 0.12)) * pro_tgt
+# ===========================================================
+# User Inputs
+# ===========================================================
 
-    # penalties to encourage variety
-    PEN_CUISINE = 20.0
-    PEN_RECIPE = 40.0
-    penalty = lpSum([
-        x[k] * ((PEN_CUISINE if rec_map[k]["cuisine"] in last_cuisines else 0.0) +
-                (PEN_RECIPE if int(rec_map[k]["id"]) in used_recipes else 0.0))
-        for k in x
-    ])
-    prob += penalty
+st.sidebar.header("User Profile")
 
-    # solve quietly
+age = st.sidebar.number_input("Age", min_value=12, max_value=90, value=25)
+gender = st.sidebar.selectbox("Gender", ["male", "female"])
+height = st.sidebar.number_input("Height (cm)", value=170)
+weight = st.sidebar.number_input("Weight (kg)", value=70)
+activity = st.sidebar.selectbox("Activity Level", ["sedentary","light","moderate","active","very_active"])
+
+preferred_cuisines = [c.strip().lower() for c in st.sidebar.text_input(
+    "Preferred cuisines (comma separated)", value="indian,italian"
+).split(",")]
+
+restrictions = [normalize_ing(r) for r in st.sidebar.text_input(
+    "Dietary restrictions", value="sugar,peanut"
+).split(",")]
+
+cal_tol = st.sidebar.slider("Calorie tolerance (± %)", 0.05, 0.30, 0.12)
+pro_tol = st.sidebar.slider("Protein tolerance (± %)", 0.05, 0.30, 0.12)
+
+act_factor = {"sedentary":1.2,"light":1.375,"moderate":1.55,"active":1.725,"very_active":1.9}
+
+def calorie_target():
+    base = 10*weight + 6.25*height - 5*age + (5 if gender=="male" else -161)
+    return int(base * act_factor[activity])
+
+def protein_target():
+    return int(weight * 0.8)
+
+# ===========================================================
+# ILP Daily Planner
+# ===========================================================
+
+def violates(ingredients):
+    return any(r in ingredients for r in restrictions)
+
+def plan_day(day, df, last_cuis, used):
+    df_f = df[df["cuisine"].isin(preferred_cuisines)]
+    df_f = df_f[~df_f["ing_list"].apply(violates)]
+    if df_f.empty: df_f = df
+
+    CAL_TGT = calorie_target()
+    PRO_TGT = protein_target()
+
+    pool = df_f.sample(min(300, len(df_f)))
+    rec_map = {(r["meal_type"], int(r["id"])): r for _, r in pool.iterrows()}
+
+    prob = LpProblem(f"Day_{day}", LpMinimize)
+    x = {k: LpVariable(f"x_{k}", 0, 1, LpBinary) for k in rec_map.keys()}
+
+    for meal in ["breakfast","lunch","dinner"]:
+        prob += lpSum(x[k] for k in x if k[0]==meal) == 1
+
+    total_cal = lpSum([x[k] * rec_map[k]["calories"] for k in x])
+    total_pro = lpSum([x[k] * rec_map[k]["protein_g"] for k in x])
+
+    prob += total_cal >= CAL_TGT*(1-cal_tol)
+    prob += total_cal <= CAL_TGT*(1+cal_tol)
+    prob += total_pro >= PRO_TGT*(1-pro_tol)
+
     prob.solve(PULP_CBC_CMD(msg=0))
 
-    # parse results
-    chosen = []
-    cuisines_used = []
-    tot_cal = 0.0
-    tot_pro = 0.0
+    chosen, cuisines, tot_cal, tot_pro = [], [], 0, 0
 
-    for k, var in x.items():
-        try:
-            val = var.value()
-        except Exception:
-            val = None
-        if val is not None and val >= 0.99:
-            rec = rec_map[k]
-            meal = {
-                "day": day_idx,
-                "meal_type": k[0],
-                "recipe_id": int(rec["id"]),
-                "name": rec.get("name",""),
-                "cuisine": rec.get("cuisine","general"),
-                "calories": float(rec.get("calories", 0.0)),
-                "protein_g": float(rec.get("protein_g", 0.0)),
-                "cost_est": float(rec.get("cost_est", 0.0)),
-                "ingredients": rec.get("ing_list", [])
-            }
-            chosen.append(meal)
-            cuisines_used.append(meal["cuisine"])
-            used_recipes.add(int(rec["id"]))
-            tot_cal += meal["calories"]
-            tot_pro += meal["protein_g"]
+    for k, v in x.items():
+        if v.value() == 1:
+            r = rec_map[k]
+            chosen.append(r)
+            cuisines.append(r["cuisine"])
+            used.add(int(r["id"]))
+            tot_cal += r["calories"]
+            tot_pro += r["protein_g"]
 
-    # fallback: if solver failed to pick 3 meals, pick top-3 from pool safely
-    if len(chosen) < 3:
-        # choose top per meal type heuristically
-        chosen = []
-        cuisines_used = []
-        for m in ["breakfast","lunch","dinner"]:
-            cand = pools[m].sort_values("rank_score", ascending=False)
-            if cand.shape[0] > 0:
-                r = cand.iloc[0]
-                meal = {
-                    "day": day_idx,
-                    "meal_type": m,
-                    "recipe_id": int(r["id"]),
-                    "name": r.get("name",""),
-                    "cuisine": r.get("cuisine","general"),
-                    "calories": float(r.get("calories", 0.0)),
-                    "protein_g": float(r.get("protein_g", 0.0)),
-                    "cost_est": float(r.get("cost_est", 0.0)),
-                    "ingredients": r.get("ing_list", [])
-                }
-                chosen.append(meal)
-                cuisines_used.append(meal["cuisine"])
-                used_recipes.add(int(r["id"]))
-                tot_cal += meal["calories"]
-                tot_pro += meal["protein_g"]
+    return chosen, cuisines, tot_cal, tot_pro, used
 
-    return {"meals": chosen, "nutrition": (tot_cal, tot_pro), "cuisines": cuisines_used, "used_recipes": used_recipes}
 
-# -------------------- categorize shopping --------------------
-CATEGORIES = {
-    "Produce": ["onion","garlic","tomato","lettuce","cilantro","ginger","pepper","spinach","zucchini","parsley","lemon","apple","banana"],
-    "Dairy": ["milk","cheese","mozzarella","paneer","ricotta","butter","yogurt","cream"],
-    "Meat": ["chicken","pork","beef","tuna","fish","egg","mutton","shrimp"],
-    "Pantry": ["flour","rice","pasta","oil","sugar","salt","vinegar","mustard","sauce","beans","bread"]
-}
-def classify_ingredient(ing):
-    ing_l = ing.lower()
-    for cat, keys in CATEGORIES.items():
-        if any(k in ing_l for k in keys):
-            return cat
-    return "Other"
-
-# -------------------- Streamlit UI --------------------
-st.title("Nutri-Bridge — Personalized Nutrition Planner")
-st.markdown("Upload `RAW_recipes_small.csv` (sampled small dataset) or use the file uploader to supply your CSV.")
-
-uploaded = st.file_uploader("Upload RAW_recipes_small.csv (or leave blank to use local file)", type=["csv"])
-if uploaded is not None:
-    recipes = load_recipes(uploaded)
-else:
-    # attempt to use local default file
-    try:
-        recipes = load_recipes("RAW_recipes_small.csv")
-    except Exception:
-        recipes = pd.DataFrame()
-
-st.info(f"Recipes available: {len(recipes)}")
-
-# Sidebar user profile
-st.sidebar.header("User Profile")
-age = st.sidebar.number_input("Age", min_value=5, max_value=120, value=30)
-gender = st.sidebar.selectbox("Gender", options=["male","female"], index=0)
-height = st.sidebar.number_input("Height (cm)", min_value=100.0, max_value=230.0, value=170.0)
-weight = st.sidebar.number_input("Weight (kg)", min_value=20.0, max_value=250.0, value=70.0)
-activity = st.sidebar.selectbox("Activity", options=["sedentary","light","moderate","active","very_active"], index=2)
-preferred_cuisines_raw = st.sidebar.text_input("Preferred cuisines (comma separated)", value="indian,italian").strip()
-preferred_cuisines = [c.strip().lower() for c in preferred_cuisines_raw.split(",") if c.strip()]
-restrictions_raw = st.sidebar.text_input("Dietary restrictions (comma separated)", value="").strip()
-restrictions = [r.strip() for r in restrictions_raw.split(",") if r.strip()]
-cal_tol = st.sidebar.slider("Calorie tolerance (±%)", 0.0, 0.5, 0.12, step=0.01)
-pro_tol = st.sidebar.slider("Protein tolerance (±%)", 0.0, 0.5, 0.12, step=0.01)
-
-user = {
-    "age": age, "gender": gender, "height": height, "weight": weight,
-    "activity": activity, "preferred_cuisines": preferred_cuisines,
-    "restrictions": restrictions, "cal_tol": cal_tol, "pro_tol": pro_tol
+# Estimated cost per ingredient category (you can adjust)
+COST_MAP = {
+    "Produce": 10,     
+    "Dairy": 20,
+    "Meat": 30,
+    "Pantry": 10,
+    "Other": 20
 }
 
-# BMR / targets
-ACTIVITY_FACTORS = {"sedentary":1.2,"light":1.375,"moderate":1.55,"active":1.725,"very_active":1.9}
-def mifflin(gender, age, h, w):
-    return (10*w + 6.25*h - 5*age + (5 if gender.lower().startswith("m") else -161))
-def calorie_target(user):
-    return int(round(mifflin(user["gender"], user["age"], user["height"], user["weight"]) * ACTIVITY_FACTORS.get(user["activity"], 1.375)))
-def protein_target(user):
-    return int(round(0.8 * user["weight"]))
 
-# Generate button
-if st.button("Generate 7-day Plan"):
-    if recipes.empty:
-        st.error("No recipes loaded. Upload RAW_recipes_small.csv or place it beside the app.")
-    else:
-        CAL_TGT = calorie_target(user)
-        PRO_TGT = protein_target(user)
-        st.success(f"Targets → Calories: {CAL_TGT} kcal/day, Protein: {PRO_TGT} g/day")
+# ===========================================================
+# Generate Weekly Plan
+# ===========================================================
 
-        week_rows = []
-        summary_rows = []
-        shopping = Counter()
-        used_recipes = set()
-        last_cuis = []
+if st.button("Generate 7-Day Plan"):
 
-        st.info("Running planner for 7 days...")
+    week = []
+    summary = []
+    shopping = Counter()
+    used_recipes = set()
+    last_cuis = []
 
-        for day in range(1, 8):
-            st.write(f"Generating Day {day}...")
-            res = build_day_plan(day, recipes, user, last_cuis, used_recipes, CAL_TGT, PRO_TGT)
-            day_plan = res["meals"]
-            last_cuis = res["cuisines"]
-            used_recipes = res["used_recipes"]
-            tot_cal, tot_pro = res["nutrition"]
+    for d in range(1, 8):
+        meals, last_cuis, tcal, tpro, used_recipes = plan_day(d, df, last_cuis, used_recipes)
 
-            summary_rows.append({"day": day, "total_calories": round(tot_cal,1), "total_protein_g": round(tot_pro,1)})
-            for m in day_plan:
-                week_rows.append({
-                    "day": day,
-                    "meal_type": m["meal_type"],
-                    "cuisine": m["cuisine"],
-                    "recipe_id": m["recipe_id"],
-                    "name": m["name"],
-                    "calories": round(m["calories"],1),
-                    "protein_g": round(m["protein_g"],1),
-                    "cost_est": round(m["cost_est"],2)
-                })
-                for ing in m.get("ingredients", []):
-                    shopping[ing] += 1
+        for r in meals:
+            week.append([d, r["meal_type"], r["cuisine"], r["name"], r["calories"], r["protein_g"], r["cost_est"]])
+            for ing in r["ing_list"]:
+                shopping[ing] += 1
 
-        # DataFrames
-        week_df = pd.DataFrame(week_rows)
-        summary_df = pd.DataFrame(summary_rows)
+        summary.append([d, round(tcal,1), round(tpro,1)])
 
-        # Ensure 21 rows (3 meals per day) if some missing, fallback fill
-        if week_df.shape[0] < 21:
-            st.warning("Planner returned fewer than 21 meals; repeating top picks to fill week.")
-            # repeat top rows until 21
-            while week_df.shape[0] < 21 and not recipes.empty:
-                top = recipes.sort_values("rank_score", ascending=False).iloc[0]
-                week_df = week_df.append({
-                    "day": week_df.shape[0]//3 + 1,
-                    "meal_type": "dinner",
-                    "cuisine": top.get("cuisine","general"),
-                    "recipe_id": int(top["id"]),
-                    "name": top.get("name",""),
-                    "calories": float(top.get("calories",0)),
-                    "protein_g": float(top.get("protein_g",0)),
-                    "cost_est": float(top.get("cost_est",0))
-                }, ignore_index=True)
+    week_df = pd.DataFrame(week, columns=["day","meal","cuisine","recipe","calories","protein","cost"])
+    summary_df = pd.DataFrame(summary, columns=["day","total_calories","total_protein"])
 
-        st.subheader("Weekly Meal Plan")
-        st.dataframe(week_df)
+    st.subheader("Weekly Meal Plan")
+    st.dataframe(week_df)
 
-        st.subheader("Daily Nutrition Summary")
-        st.dataframe(summary_df)
+    # Download CSV
+    st.download_button("⬇ Download Weekly Plan CSV", week_df.to_csv(index=False), "nutribridge_week.csv")
 
-        # Categorize shopping list -> DataFrame
-        shop_rows = []
-        for ing, qty in shopping.items():
-            shop_rows.append([classify_ingredient(ing), ing, int(qty)])
-        if shop_rows:
-            shop_df = pd.DataFrame(shop_rows, columns=["Category","Ingredient","Quantity"])
-        else:
-            shop_df = pd.DataFrame(columns=["Category","Ingredient","Quantity"])
+    st.subheader("Daily Nutrition Summary")
+    st.dataframe(summary_df)
+    st.download_button("⬇ Download Nutrition Summary CSV", summary_df.to_csv(index=False), "nutribridge_summary.csv")
 
-        st.subheader("Categorized Shopping List")
-        st.dataframe(shop_df)
+    # Categorized shopping list
+    CATS = {"Produce": [], "Dairy": [], "Meat": [], "Pantry": [], "Other": []}
+    def classify(ing):
+        ing = ing.lower()
+        if any(x in ing for x in ["onion","garlic","tomato","pepper","lettuce","cilantro","ginger"]): return "Produce"
+        if any(x in ing for x in ["milk","cheese","butter","yogurt","paneer","ricotta"]): return "Dairy"
+        if any(x in ing for x in ["chicken","beef","fish","pork","egg"]): return "Meat"
+        if any(x in ing for x in ["rice","flour","salt","oil","bread","pasta"]): return "Pantry"
+        return "Other"
 
-        # Downloads
-        st.download_button("Download weekly plan CSV", week_df.to_csv(index=False).encode('utf-8'), "nutribridge_week.csv", "text/csv")
-        st.download_button("Download nutrition summary CSV", summary_df.to_csv(index=False).encode('utf-8'), "nutribridge_summary.csv", "text/csv")
-        st.download_button("Download shopping CSV", shop_df.to_csv(index=False).encode('utf-8'), "nutribridge_shopping.csv", "text/csv")
 
-        # Nutrition trend graph (Calories & Protein different colors)
-        st.subheader("Nutrition Trend (Calories & Protein)")
-        fig, ax = plt.subplots(figsize=(9,4))
-        ax.plot(summary_df["day"], summary_df["total_calories"], marker='o', linewidth=2, color='tab:blue', label='Calories (kcal)')
-        ax.set_xlabel("Day")
-        ax.set_ylabel("Calories (kcal)", color='tab:blue')
-        ax2 = ax.twinx()
-        ax2.plot(summary_df["day"], summary_df["total_protein_g"], marker='s', linewidth=2, color='tab:orange', label='Protein (g)')
-        ax2.set_ylabel("Protein (g)", color='tab:orange')
-        lines, labels = ax.get_legend_handles_labels()
-        lines2, labels2 = ax2.get_legend_handles_labels()
-        ax.legend(lines + lines2, labels + labels2, loc='upper left')
-        st.pyplot(fig)
+    # Build categorized & cost list
+    rows = []
+    total_cost = 0
 
-        # Ingredient frequency bar chart (top 15)
-        st.subheader("Ingredient Frequency (Top 15)")
-        if not shop_df.empty:
-            freq = shop_df.groupby("Ingredient")["Quantity"].sum().reset_index().sort_values("Quantity", ascending=False).head(15)
-            fig2, ax3 = plt.subplots(figsize=(9, max(3, 0.25*len(freq))))
-            ax3.barh(freq["Ingredient"][::-1], freq["Quantity"][::-1])
-            ax3.set_xlabel("Times required this week")
-            st.pyplot(fig2)
-        else:
-            st.info("No shopping items (shopping list is empty).")
+    for ing, qty in shopping.items():
+        category = classify(ing)
+        est_cost = COST_MAP[category] * qty  # qty × category price
+        total_cost += est_cost
 
-        st.success("Plan generation complete.")
+        rows.append([category, ing, qty, est_cost])
+
+    shopping_df = pd.DataFrame(rows, columns=["Category", "Ingredient", "Quantity", "Estimated Cost"])
+
+    st.subheader("Categorized Shopping List with Cost")
+    st.dataframe(shopping_df)
+
+    # Show total cost
+    st.success(f"Estimated Total Weekly Grocery Cost: **₹ {round(total_cost, 2)}**")
+
+    # CSV download
+    st.download_button(
+        "⬇ Download Categorized Shopping List (CSV)",
+        shopping_df.to_csv(index=False).encode("utf-8"),
+        "nutribridge_shopping_list_with_cost.csv",
+        mime="text/csv"
+    )
+
+    # ===========================================================
+    # Graph 1 — Calories & Protein Trend
+    # ===========================================================
+
+    st.subheader("Daily Calories & Protein Trend")
+
+    fig, ax1 = plt.subplots()
+    ax1.plot(summary_df.day, summary_df.total_calories, marker='o', color='blue', linewidth=3)
+    ax1.set_xlabel("Day")
+    ax1.set_ylabel("Calories", color='blue')
+
+    ax2 = ax1.twinx()
+    ax2.plot(summary_df.day, summary_df.total_protein, marker='s', color='green', linestyle="--", linewidth=3)
+    ax2.set_ylabel("Protein (g)", color='green')
+
+    st.pyplot(fig)
+
+    # ===========================================================
+    # Graph 2 — Ingredient Frequency
+    # ===========================================================
+
+    st.subheader("Top Ingredients Used (Frequency)")
+
+    freq = pd.DataFrame(shopping.items(), columns=["Ingredient","Qty"])
+    freq = freq.sort_values("Qty", ascending=False).head(15)
+
+    plt.figure(figsize=(8,6))
+    plt.barh(freq["Ingredient"], freq["Qty"])
+    plt.title("Most Used Ingredients")
+    plt.xlabel("Count")
+    st.pyplot(plt)
