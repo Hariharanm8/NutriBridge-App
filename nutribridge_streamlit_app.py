@@ -144,7 +144,7 @@ def plan_day(day, df, last_cuis, used):
 
 # Estimated cost per ingredient category (you can adjust)
 COST_MAP = {
-    "Produce": 10,     
+    "Produce": 10,     # ₹ / item
     "Dairy": 20,
     "Meat": 30,
     "Pantry": 10,
@@ -168,13 +168,13 @@ if st.button("Generate 7-Day Plan"):
         meals, last_cuis, tcal, tpro, used_recipes = plan_day(d, df, last_cuis, used_recipes)
 
         for r in meals:
-            week.append([d, r["meal_type"], r["cuisine"], r["name"], r["calories"], r["protein_g"], r["cost_est"]])
+            week.append([d, r["meal_type"], r["cuisine"], r["name"], r["calories"], r["protein_g"]])
             for ing in r["ing_list"]:
                 shopping[ing] += 1
 
         summary.append([d, round(tcal,1), round(tpro,1)])
 
-    week_df = pd.DataFrame(week, columns=["day","meal","cuisine","recipe","calories","protein","cost"])
+    week_df = pd.DataFrame(week, columns=["day","meal","cuisine","recipe","calories","protein"])
     summary_df = pd.DataFrame(summary, columns=["day","total_calories","total_protein"])
 
     st.subheader("Weekly Meal Plan")
