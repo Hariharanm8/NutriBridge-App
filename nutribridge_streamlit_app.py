@@ -226,14 +226,14 @@ st.title("Nutri-Bridge — Personalized Nutrition Planner")
 st.markdown("Generate a 7-day nutrition plan with ILP, categorized shopping list and analytics.")
 
 # Upload or use path
-uploaded_file = st.file_uploader("Upload RAW_recipes.csv (or leave blank to use local /content/RAW_recipes.csv)", type=["csv"])
+uploaded_file = st.file_uploader("Upload RAW_recipes_small.csv", type=["csv"])
 if uploaded_file is not None:
     recipes = load_recipes_from_csv(uploaded_file)
 else:
     try:
-        recipes = load_recipes_from_csv("/content/RAW_recipes.csv")
+        recipes = load_recipes_from_csv("/content/RAW_recipes_small.csv")   # << HERE
     except:
-        st.warning("No dataset uploaded and /content/RAW_recipes.csv not found — upload a CSV.")
+        st.warning("RAW_recipes_small.csv not found — upload a CSV.")
         recipes = pd.DataFrame()
 
 st.info(f"Recipes loaded: {len(recipes)}")
@@ -383,3 +383,4 @@ if st.button("Generate 7-day Plan"):
 
         st.success(f"Plan generated. Estimated weekly recipe-cost sum (approx): {round(total_cost,2)} units")
         st.info("You can download CSVs using the buttons above.")
+
