@@ -9,7 +9,20 @@ from ast import literal_eval
 from pulp import LpProblem, LpVariable, LpMinimize, LpBinary, lpSum, PULP_CBC_CMD
 from collections import Counter
 import matplotlib.pyplot as plt
+import re
 
+# NLTK for ingredient normalization
+import nltk
+from nltk.stem import PorterStemmer
+
+# Download required NLTK data (runs once)
+try:
+    nltk.data.find('tokenizers/punkt')
+except LookupError:
+    nltk.download('punkt', quiet=True)
+
+# Initialize stemmer
+stemmer = PorterStemmer()
 
 st.set_page_config(page_title="Nutri-Bridge: Weekly Nutrition Planner", layout="wide")
 st.title("Nutri-Bridge — AI Weekly Nutrition Planner")
@@ -20,10 +33,47 @@ st.title("Nutri-Bridge — AI Weekly Nutrition Planner")
 # ===========================================================
 
 def normalize_ing(x):
-    """Normalize ingredient string"""
+    """Normalize ingredient string with stemming for singular/plural handling"""
     if not isinstance(x, str):
         return ""
-    return "_".join(x.lower().replace(",", "").replace(".", "").replace("-", " ").split())
+    # Remove special characters, lowercase
+    cleaned = re.sub(r'[^\w\s]', '', x.lower())
+    words = cleaned.split()
+    # Stem each word to handle singular/plural (onion/onions -> onion)
+    stemmed = [stemmer.stem(w) for w in words if len(w) > 2]
+    return "_".join(stemmed) if stemmed else ""
+
+
+def is_in_pantry(recipe_ing, pantry_set):
+    """Check if recipe ingredient matches pantry with partial matching"""
+    if not recipe_ing:
+        return False
+    
+    recipe_norm = normalize_ing(recipe_ing)
+    if not recipe_norm:
+        return False
+    
+    # Exact match
+    if recipe_norm in pantry_set:
+        return True
+    
+    # Partial match: check if any pantry item is in recipe ingredient
+    # (e.g., "salt" matches "salt_and_pepper")
+    for pantry_item in pantry_set:
+        if pantry_item and (pantry_item in recipe_norm or recipe_norm in pantry_item):
+            return True
+    
+    return False
+
+
+def violates_restrictions(ingredients, restrictions):
+    """Check restrictions with improved matching"""
+    for ing in ingredients:
+        ing_norm = normalize_ing(ing)
+        for restriction in restrictions:
+            if restriction and ing_norm and (restriction in ing_norm or ing_norm in restriction):
+                return True
+    return False
 
 
 def safe_list(x):
@@ -50,10 +100,6 @@ def detect_cuisine(name, tags):
         if c in text:
             return c
     return "general"
-
-
-def violates_restrictions(ingredients, restrictions):
-    return any(r in ingredients for r in restrictions)
 
 
 # ===========================================================
@@ -98,21 +144,23 @@ preferred_cuisines = [c.strip().lower() for c in st.sidebar.text_input(
     "Preferred cuisines (comma separated)", "indian,italian"
 ).split(",")]
 
-restrictions = [normalize_ing(r) for r in st.sidebar.text_input(
+restrictions_input = st.sidebar.text_input(
     "Dietary restrictions (comma separated)", "sugar"
-).split(",")]
+)
+restrictions = [normalize_ing(r.strip()) for r in restrictions_input.split(",") if r.strip()]
 
 # Pantry Mode
 st.sidebar.markdown("---")
 st.sidebar.subheader("Pantry Mode")
 pantry_items = st.sidebar.text_area("Items already available:", placeholder="e.g., onion, rice, egg")
-PANTRY = {normalize_ing(i) for i in pantry_items.split(",") if i.strip()}
+PANTRY = {normalize_ing(i.strip()) for i in pantry_items.split(",") if i.strip()}
 
 cal_tol = st.sidebar.slider("Calorie tolerance (± %)", 0.05, 0.30, 0.12)
 pro_tol = st.sidebar.slider("Protein tolerance (± %)", 0.05, 0.30, 0.12)
 
 # BMR function
 ACTIVITY_FACTORS = {"sedentary":1.2,"light":1.375,"moderate":1.55,"active":1.725,"very_active":1.9}
+
 def calorie_target():
     base = 10*weight + 6.25*height - 5*age + (5 if gender=="male" else -161)
     return int(base * ACTIVITY_FACTORS[activity])
@@ -127,7 +175,7 @@ def protein_target():
 
 def plan_day(day, df, last_cuis, used_recipes):
     df_f = df[df["cuisine"].isin(preferred_cuisines)]
-    df_f = df_f[~df_f["ing_list"].apply(lambda ings: violates_restrictions(ings, restrictions))]
+    df_f = df_f[~df_f["ingredients"].apply(lambda ings: violates_restrictions(ings, restrictions))]
     if df_f.empty:
         df_f = df
 
@@ -202,10 +250,12 @@ if st.button("Generate 7-Day Meal Plan"):
             week.append([d, r["meal_type"], r["cuisine"], r["name"], r["ingredients"], r["steps"],
                          f"{r['calories']} cal", f"{r['protein_g']} g"])
 
-            for ing in r["ing_list"]:
-                ing = normalize_ing(ing)
-                if ing not in PANTRY:          # Skip pantry items
-                    SHOPPING[ing] += 1
+            # Use improved pantry matching
+            for ing in r["ingredients"]:
+                if not is_in_pantry(ing, PANTRY):
+                    normalized = normalize_ing(ing)
+                    if normalized:  # Only add if normalization succeeded
+                        SHOPPING[normalized] += 1
 
         summary.append([d, round(tcal,1), round(tpro,1)])
 
@@ -262,12 +312,13 @@ if st.button("Generate 7-Day Meal Plan"):
 
     # Graph 2: Ingredient frequency
     st.subheader("Top Ingredients Used")
-    freq = pd.DataFrame(SHOPPING.items(), columns=["Ingredient","Qty"]).sort_values("Qty", ascending=False).head(15)
-    plt.figure(figsize=(8,6))
-    plt.barh(freq["Ingredient"], freq["Qty"])
-    st.pyplot(plt)
+    if SHOPPING:
+        freq = pd.DataFrame(SHOPPING.items(), columns=["Ingredient","Qty"]).sort_values("Qty", ascending=False).head(15)
+        plt.figure(figsize=(8,6))
+        plt.barh(freq["Ingredient"], freq["Qty"])
+        st.pyplot(plt)
 
 
     if PANTRY:
-        st.info(f"Pantry Mode enabled — removed {len(PANTRY)} ingredients from shopping list.")
-
+        pantry_count = len(PANTRY)
+        st.info(f"✅ Pantry Mode enabled — {pantry_count} ingredient type(s) excluded from shopping list.")
